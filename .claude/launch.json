@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "chat",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "uvicorn", "testing.server:app", "--reload", "--port", "8000"],
+      "port": 8000
+    }
+  ]
+}

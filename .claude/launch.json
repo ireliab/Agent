@@ -4,7 +4,7 @@
     {
       "name": "chat",
       "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "uvicorn", "testing.server:app", "--reload", "--port", "8000"],
+      "runtimeArgs": ["run", "uvicorn", "testing.server:app", "--reload", "--reload-dir", "src", "--port", "8000"],
       "port": 8000
     }
   ]

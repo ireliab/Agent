@@ -1,0 +1,3 @@
+# The committed copy of index.html once contained stray NUL bytes, which made
+# git treat it as binary and hide the diff. Force a text diff.
+*.html diff

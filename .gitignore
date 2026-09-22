@@ -15,3 +15,6 @@ wheels/
 # Agent-generated files
 outputs/
 uploads/
+
+# Local conversation database
+conversations.sqlite*

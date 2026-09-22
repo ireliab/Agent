@@ -7,15 +7,19 @@ exactly the same agent definition.
 import os
 from typing import Literal
 
+import json
+
 from deepagents import FilesystemMiddleware, create_deep_agent
 from dotenv import load_dotenv
 from langchain.agents.middleware import (
+    AgentMiddleware,
     ClearToolUsesEdit,
     ContextEditingMiddleware,
     ModelCallLimitMiddleware,
     TodoListMiddleware,
     ToolCallLimitMiddleware,
 )
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from tavily import TavilyClient
@@ -43,7 +47,13 @@ RECURSION_LIMIT = int(os.environ.get("RECURSION_LIMIT", str(MAX_MODEL_CALLS * 8 
 # `execute` ships with the filesystem middleware but only works on a backend
 # implementing SandboxBackendProtocol. StateBackend is not one, so the tool
 # would always fail - leave it out rather than let the model waste turns on it.
-FILESYSTEM_TOOLS = ["ls", "read_file", "write_file", "edit_file", "glob", "grep", "delete"]
+# `delete` is left out: the agent reached for it on a hallucinated path while
+# flailing at an unrelated problem, and nothing here needs it.
+FILESYSTEM_TOOLS = ["ls", "read_file", "write_file", "edit_file", "glob", "grep"]
+
+# How many times the same tool may be called with identical arguments before
+# the call is refused.
+MAX_IDENTICAL_CALLS = int(os.environ.get("MAX_IDENTICAL_CALLS", "2"))
 
 # Tools that need the user to approve them before they run. These are the ones
 # with an effect outside the conversation. Set INTERRUPT_TOOLS="" to turn the
@@ -75,7 +85,12 @@ Saving files:
 
 Uploaded files:
 - When the user attaches a file, read it with `read_document` before answering
-  questions about it. `list_uploads` shows what is available.
+  questions about it. Pass the attachment's NUMBER, e.g. read_document("1") -
+  never retype a long or non-English filename, you will get it wrong.
+- `glob`, `grep` and `read_file` search a scratch workspace, NOT the user's
+  uploads. They will never find an attached file. Use `read_document`.
+- If a tool call fails, do not repeat it unchanged. Change the arguments or
+  say what is blocking you.
 
 Delegating:
 - For anything needing several web searches, delegate to the `researcher`
@@ -160,6 +175,61 @@ def build_subagents() -> list[dict]:
     ]
 
 
+class RepeatedCallGuard(AgentMiddleware):
+    """Refuse a tool call the agent has already made with identical arguments.
+
+    Small models answer a failed tool call by retrying it verbatim, which burns
+    the whole run budget without ever changing the input. Blocking the repeat
+    and saying so explicitly is what breaks the loop.
+
+    The count comes from the conversation's own history rather than from
+    instance state, so it is naturally per-thread and resets with a new chat.
+    """
+
+    def __init__(self, limit: int = MAX_IDENTICAL_CALLS) -> None:
+        super().__init__()
+        self.limit = limit
+
+    @staticmethod
+    def _key(call: dict) -> str:
+        return json.dumps(
+            {"name": call.get("name"), "args": call.get("args")}, sort_keys=True, default=str
+        )
+
+    def _blocked(self, request) -> ToolMessage | None:
+        key = self._key(request.tool_call)
+        seen = 0
+        for message in (request.state or {}).get("messages") or []:
+            if isinstance(message, AIMessage):
+                seen += sum(1 for call in message.tool_calls or [] if self._key(call) == key)
+        if seen <= self.limit:
+            return None
+        name = request.tool_call.get("name")
+        return ToolMessage(
+            content=(
+                f"Blocked: `{name}` has already been called with these exact "
+                f"arguments {seen - 1} times and did not work. Repeating it will "
+                f"not help. Change the arguments, use a different tool, or tell "
+                f"the user what is blocking you."
+            ),
+            tool_call_id=request.tool_call.get("id", ""),
+            name=name,
+            status="error",
+        )
+
+    def wrap_tool_call(self, request, handler):
+        blocked = self._blocked(request)
+        return blocked if blocked is not None else handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        # The server drives the agent asynchronously, so this one is the path
+        # that actually runs; the sync version is for notebook use.
+        blocked = self._blocked(request)
+        if blocked is not None:
+            return blocked
+        return await handler(request)
+
+
 def build_middleware() -> list:
     """Middleware added on top of the deepagents default stack.
 
@@ -169,6 +239,7 @@ def build_middleware() -> list:
     return [
         # Gives the agent a `write_todos` tool so it plans before acting.
         TodoListMiddleware(),
+        RepeatedCallGuard(),
         FilesystemMiddleware(tools=FILESYSTEM_TOOLS),
         # Drop stale tool results once the context gets long, keeping the most
         # recent few so the model still sees what it just did.
@@ -196,7 +267,11 @@ def build_agent(checkpointer=None):
         middleware=build_middleware(),
         subagents=build_subagents(),
         interrupt_on={
-            name: {"allowed_decisions": ["approve", "reject"]} for name in INTERRUPT_TOOLS
+            # All four decisions langchain supports: run as-is, run with edited
+            # arguments, refuse (optionally saying why), or answer on the tool's
+            # behalf without running it.
+            name: {"allowed_decisions": ["approve", "edit", "reject", "respond"]}
+            for name in INTERRUPT_TOOLS
         }
         or None,
         checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),

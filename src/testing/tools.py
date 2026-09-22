@@ -5,7 +5,9 @@ virtual filesystem that never touches the disk. Anything the user should be able
 to open afterwards has to be written here instead, into `OUTPUT_DIR`.
 """
 
+import contextvars
 import re
+import unicodedata
 from pathlib import Path
 
 from docx import Document
@@ -129,8 +131,29 @@ def write_text_file(filename: str, content: str) -> str:
     return f"Saved to {path}. The user can download it from the Files panel."
 
 
-UPLOAD_DIR = Path.cwd() / "uploads"
+UPLOAD_ROOT = Path.cwd() / "uploads"
 MAX_EXTRACTED_CHARS = 20000
+
+# Uploads are stored per conversation. A flat shared directory meant a new chat
+# could see - and answer from - a document uploaded in a previous one.
+_upload_scope: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "upload_scope", default=None
+)
+
+
+def set_upload_scope(thread_id: str | None) -> None:
+    """Point the upload tools at one conversation's files."""
+    _upload_scope.set(thread_id)
+
+
+def upload_dir(thread_id: str | None = None) -> Path:
+    """The upload directory for a conversation."""
+    thread = thread_id or _upload_scope.get()
+    if not thread:
+        return UPLOAD_ROOT / "_unscoped"
+    # The thread id comes from the browser, so keep it to a safe directory name.
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", thread)[:80] or "_unscoped"
+    return UPLOAD_ROOT / safe
 
 
 def _truncate(text: str) -> str:
@@ -172,25 +195,122 @@ def _read_xlsx(path: Path) -> str:
 
 _READERS = {".pdf": _read_pdf, ".docx": _read_docx, ".xlsx": _read_xlsx, ".xlsm": _read_xlsx}
 
+# Images are not read as text: they go to the model as image content blocks
+# instead, since Qwen3.5 is multimodal. These other binaries cannot be read at
+# all, so say so plainly rather than returning decoded noise.
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg", ".heic"}
+BINARY_SUFFIXES = {".zip", ".exe", ".dll", ".mp4", ".mp3", ".mov", ".pptx", ".doc", ".xls"}
+
+
+ZERO_WIDTH = "​‌‍﻿"
+
+
+def _match_key(name: str) -> str:
+    """A comparison key that survives a model retyping the filename.
+
+    Small models re-tokenise non-ASCII filenames and reliably reinsert stray
+    spaces around CJK runs ("Brief_2 頁" for "Brief_2頁"), so an exact match
+    sends them into a retry loop they cannot escape. Compare with whitespace,
+    zero-width characters, Unicode form and case all ignored.
+    """
+    name = unicodedata.normalize("NFKC", name)
+    stripped = [c for c in name if not c.isspace() and c not in ZERO_WIDTH]
+    return "".join(stripped).casefold()
+
+
+def uploaded_files(thread_id: str | None = None) -> list[Path]:
+    """This conversation's uploads, in the order their numbers refer to."""
+    directory = upload_dir(thread_id)
+    if not directory.exists():
+        return []
+    return sorted((p for p in directory.iterdir() if p.is_file()), key=lambda p: p.name)
+
+
+def _resolve_upload(filename: str) -> Path | None:
+    """Find the upload the model meant, tolerating an imperfectly typed name."""
+    files = uploaded_files()
+    if not files:
+        return None
+
+    wanted = (filename or "").strip()
+    directory = upload_dir()
+
+    # A 1-based index, which is what the agent is told to prefer.
+    if wanted.isdigit():
+        index = int(wanted)
+        return files[index - 1] if 1 <= index <= len(files) else None
+
+    exact = directory / Path(wanted).name
+    if exact.is_file():
+        return exact
+
+    key = _match_key(Path(wanted).name)
+    matches = [f for f in files if _match_key(f.name) == key]
+    if len(matches) == 1:
+        return matches[0]
+
+    partial = [f for f in files if key and (key in _match_key(f.name) or _match_key(f.name) in key)]
+    if len(partial) == 1:
+        return partial[0]
+
+    # Last resort: a single upload of the same type. Requiring the extension to
+    # match matters — without it, a request for a file that was never uploaded
+    # silently returns the one that was, and the model reports on the wrong
+    # document rather than saying it could not find anything.
+    suffix = Path(wanted).suffix.lower()
+    if len(files) == 1 and suffix and files[0].suffix.lower() == suffix:
+        return files[0]
+    return None
+
+
+def upload_listing(thread_id: str | None = None) -> str:
+    """The numbered listing. The server builds its prompt from this same
+    function, so the numbers the agent is shown always match the numbers
+    `read_document` resolves."""
+    files = uploaded_files(thread_id)
+    if not files:
+        return "none"
+    return "; ".join(f"{i}. {f.name}" for i, f in enumerate(files, 1))
+
+
+def _upload_listing() -> str:
+    return upload_listing()
+
 
 def read_document(filename: str) -> str:
     """Read a file the user uploaded, and return its text.
 
-    Supports .pdf, .docx, .xlsx, .csv, .txt and .md. Use this whenever the user
-    refers to a file they attached.
+    Supports .pdf, .docx, .xlsx, .csv, .txt and .md.
 
     Args:
-        filename: Name of the uploaded file, e.g. "report.pdf".
+        filename: The number of the attachment as shown in the message
+            (e.g. "1"), which is the most reliable way to refer to it, or the
+            file name.
 
     Returns:
         The file's text content, truncated if very long.
     """
-    path = UPLOAD_DIR / Path(filename).name
-    if not path.is_file():
-        available = sorted(p.name for p in UPLOAD_DIR.iterdir()) if UPLOAD_DIR.exists() else []
-        return f"No uploaded file named {filename!r}. Available uploads: {available or 'none'}"
+    path = _resolve_upload(filename)
+    if path is None:
+        return (
+            f"No uploaded file matches {filename!r}. "
+            f"Available uploads: {_upload_listing()}. "
+            f"Call read_document with the NUMBER instead, e.g. read_document('1'). "
+            f"Do not retry the same filename."
+        )
 
-    reader = _READERS.get(path.suffix.lower())
+    suffix = path.suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        return (
+            f"{path.name!r} is an image and has already been attached to this "
+            f"conversation visually - look at it directly and describe what you "
+            f"see. read_document only extracts text, so there is nothing to read "
+            f"here. Do not read a different file instead."
+        )
+    if suffix in BINARY_SUFFIXES:
+        return f"{path.name!r} is a {suffix} file, which cannot be read as text."
+
+    reader = _READERS.get(suffix)
     try:
         text = reader(path) if reader else path.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
@@ -200,8 +320,59 @@ def read_document(filename: str) -> str:
 
 
 def list_uploads() -> str:
-    """List the files the user has uploaded in this session."""
-    if not UPLOAD_DIR.exists():
+    """List the files the user has uploaded, numbered for use with read_document."""
+    listing = _upload_listing()
+    if listing == "none":
         return "No files uploaded."
-    names = sorted(p.name for p in UPLOAD_DIR.iterdir() if p.is_file())
-    return "\n".join(names) if names else "No files uploaded."
+    return f"{listing}\n\nRead one with its number, e.g. read_document('1')."
+
+
+# Images are sent exactly as uploaded - no resizing, no re-encoding - so the
+# model sees the full detail. Note that an attached image stays in the
+# conversation history and is re-sent on every model call in that thread, so a
+# large photo costs its tokens repeatedly.
+IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+    ".heic": "image/heic",
+    ".svg": "image/svg+xml",
+}
+
+
+def encode_image(path: Path) -> tuple[str, str]:
+    """Return (mime_type, base64 data) for an image, byte-for-byte as uploaded."""
+    import base64
+
+    mime = IMAGE_MIME.get(path.suffix.lower(), "application/octet-stream")
+    return mime, base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def image_attachments(names: list[str], thread_id: str | None = None) -> list[dict]:
+    """Build the model content blocks for any images among these attachments.
+
+    langchain converts this standard block into the OpenAI `image_url` data-URL
+    form that vLLM expects.
+    """
+    blocks: list[dict] = []
+    directory = upload_dir(thread_id)
+    for name in names:
+        path = directory / Path(name).name
+        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        try:
+            mime, data = encode_image(path)
+        except Exception:
+            continue  # unreadable image: fall back to treating it as a plain file
+        blocks.append(
+            {"type": "image", "source_type": "base64", "mime_type": mime, "data": data}
+        )
+    return blocks
+
+
+def is_image(name: str) -> bool:
+    return Path(name).suffix.lower() in IMAGE_SUFFIXES

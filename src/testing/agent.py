@@ -5,7 +5,7 @@ exactly the same agent definition.
 """
 
 import os
-from typing import Literal
+from typing import Any, Literal
 
 import json
 
@@ -24,7 +24,15 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from tavily import TavilyClient
 
-from testing.tools import list_uploads, read_document, write_docx, write_text_file
+from testing.tools import (
+    image_attachments,
+    is_image,
+    list_uploads,
+    read_document,
+    upload_listing,
+    write_docx,
+    write_text_file,
+)
 
 load_dotenv()
 
@@ -97,6 +105,46 @@ Delegating:
   subagent with the `task` tool rather than searching repeatedly yourself.
 - Do the work yourself when it is a single step; delegation costs a round trip.
 """
+
+
+def build_user_content(message: str, attachments: list[str], thread_id: str) -> Any:
+    """Build the user message the model actually receives, attachments included.
+
+    Lives here rather than in the web server so the eval harness exercises this
+    exact prompt shaping instead of a copy of it that can drift.
+
+    Attachments are numbered from the same listing `read_document` resolves
+    against, so "1" means the same file to the model as it does to the tool.
+    They used to be numbered independently: the prompt numbered this message's
+    attachments while the tool numbered every upload on disk, so a new chat
+    asking about "1" was handed a document from an older conversation.
+    """
+    if not attachments:
+        return message
+
+    listed = upload_listing(thread_id)
+    images = [n for n in attachments if is_image(n)]
+    documents = [n for n in attachments if not is_image(n)]
+    parts = [f"[The user just attached: {', '.join(attachments)}."]
+    if images:
+        # The model is multimodal, so images travel in the message itself
+        # rather than through a tool.
+        parts.append(
+            f"The image(s) {', '.join(images)} are included below - "
+            f"look at them directly."
+        )
+    if documents:
+        parts.append(
+            f"Files in this conversation: {listed}. "
+            f"Read one with read_document and its NUMBER, e.g. read_document('1')."
+        )
+    message = " ".join(parts) + "]\n\n" + message
+
+    blocks = image_attachments(attachments, thread_id)
+    if blocks:
+        return [{"type": "text", "text": message}, *blocks]
+    return message
+
 
 _tavily_client: TavilyClient | None = None
 
@@ -230,13 +278,20 @@ class RepeatedCallGuard(AgentMiddleware):
         return await handler(request)
 
 
-def build_middleware() -> list:
+def build_middleware(extra: list | None = None) -> list:
     """Middleware added on top of the deepagents default stack.
 
     Passing a middleware whose `.name` matches one already in the stack replaces
     it, which is how `FilesystemMiddleware` below drops the `execute` tool.
+
+    Args:
+        extra: placed first in the stack. langchain composes middleware with the
+            first entry as the outermost layer, so instrumentation goes here to
+            observe every model and tool call - including ones a later
+            middleware refuses.
     """
     return [
+        *(extra or []),
         # Gives the agent a `write_todos` tool so it plans before acting.
         TodoListMiddleware(),
         RepeatedCallGuard(),
@@ -253,18 +308,19 @@ def build_middleware() -> list:
     ]
 
 
-def build_agent(checkpointer=None):
+def build_agent(checkpointer=None, extra_middleware: list | None = None):
     """Build the agent.
 
     Args:
         checkpointer: where conversation history lives. Defaults to in-memory,
             which means history is lost when the process restarts.
+        extra_middleware: appended to the middleware stack, for instrumentation.
     """
     return create_deep_agent(
         model=build_model(),
         tools=[internet_search, write_docx, write_text_file, read_document, list_uploads],
         system_prompt=SYSTEM_PROMPT,
-        middleware=build_middleware(),
+        middleware=build_middleware(extra_middleware),
         subagents=build_subagents(),
         interrupt_on={
             # All four decisions langchain supports: run as-is, run with edited

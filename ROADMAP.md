@@ -55,7 +55,7 @@ Update this file in the same commit as the change it describes.
 | 20 | File upload | ✅ | Scoped per conversation |
 | 21 | Token usage display | ✅ | Per turn, summed across model calls |
 | 22 | Conversation history list | ✅ | Sidebar lists conversations; reopening restores transcript, plan and pending approval |
-| 23 | Eval harness | ⬜ | The way to tell whether a prompt change helped, or you got lucky once |
+| 23 | Eval harness | ✅ | `python -m evals.run`. 17 fixtures, repeated runs, mechanical checks; see [evals/README.md](evals/README.md) |
 | 24 | Model fallback / retry | ⬜ | `ModelFallbackMiddleware` / `ModelRetryMiddleware` |
 
 ---
@@ -78,6 +78,10 @@ filesystem tools `ls` / `read_file` / `write_file` / `edit_file` / `glob` /
 **Knobs** (`.env`): `MAX_MODEL_CALLS`, `MAX_TOOL_CALLS`, `CONTEXT_EDIT_TRIGGER`,
 `RECURSION_LIMIT`, `INTERRUPT_TOOLS`, `STREAM_USAGE`, `MAX_IDENTICAL_CALLS`.
 
+**Evals:** `python -m evals.run --exclude network --reps 3`. Measures speed,
+token cost, tool-use quality, approval handling and termination, repeated
+enough times to see the spread. `python -m evals.selftest` checks the checks.
+
 ---
 
 ## Fixes worth remembering
@@ -98,6 +102,7 @@ make again.
 | New chat answered from an old chat's PDF | Uploads were a flat shared directory, and the prompt's numbering did not match the tool's |
 | Agent said it could not see images | The model *is* multimodal (`Qwen3_5ForConditionalGeneration`); the pipeline just never sent them |
 | UI edits silently did nothing | Static files were served without `Cache-Control`, and `--reload` was watching `.venv` |
+| A refused tool call left no trace in the eval probe | The approval middleware short-circuits *before* the tool wrapper, so `calls_tool` cannot see it - `requests_tool` exists for this |
 
 ---
 
@@ -105,7 +110,13 @@ make again.
 
 - **Nothing here is tuned for this model.** Most verification ran against a stub
   model server, because the vLLM endpoint is not reachable from the dev
-  environment. Wiring is proven; behaviour on a 9B is not.
+  environment. Wiring is proven; behaviour on a 9B is not. The eval suite exists
+  to close exactly this gap - it has never been run against the real model.
+- **The blocker is the network route, not a sandbox.** The dev machine cannot
+  reach the Tailscale coordination server, so it has no path to the machine
+  serving the model - and neither does the web server running on it. Run the
+  evals from a machine with a working path, ideally the one hosting vLLM, where
+  the endpoint is local and vLLM's own metrics are readable too.
 - **Subagents on a small model.** Delegation adds a round trip and a nested
   agent loop. On a model that already struggles to terminate, this may cost more
   than it saves.

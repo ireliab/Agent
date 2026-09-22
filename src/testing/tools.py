@@ -15,17 +15,38 @@ from docx.shared import Pt
 
 OUTPUT_DIR = Path.cwd() / "outputs"
 
+# The eval harness redirects these so a run cannot collide with a concurrent one
+# - or overwrite the user's real files. Context variables rather than globals,
+# because asyncio copies the context per task, so concurrent runs stay separate.
+_output_root: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "output_root", default=None
+)
+_upload_root: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "upload_root", default=None
+)
+
+
+def set_file_roots(outputs: Path | None = None, uploads: Path | None = None) -> None:
+    """Redirect where files are written and read. For tests; unset restores default."""
+    _output_root.set(Path(outputs) if outputs else None)
+    _upload_root.set(Path(uploads) if uploads else None)
+
+
+def output_root() -> Path:
+    return _output_root.get() or OUTPUT_DIR
+
 
 def _safe_output_path(filename: str, suffix: str) -> Path:
-    """Resolve a model-supplied filename to a path inside OUTPUT_DIR.
+    """Resolve a model-supplied filename to a path inside the output directory.
 
     The model chooses this name, so strip any directory part before using it.
     """
     stem = Path(filename).name.strip() or "report"
     if not stem.lower().endswith(suffix):
         stem = f"{Path(stem).stem}{suffix}"
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return OUTPUT_DIR / stem
+    root = output_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return root / stem
 
 
 def _add_runs(paragraph, text: str) -> None:
@@ -148,12 +169,13 @@ def set_upload_scope(thread_id: str | None) -> None:
 
 def upload_dir(thread_id: str | None = None) -> Path:
     """The upload directory for a conversation."""
+    root = _upload_root.get() or UPLOAD_ROOT
     thread = thread_id or _upload_scope.get()
     if not thread:
-        return UPLOAD_ROOT / "_unscoped"
+        return root / "_unscoped"
     # The thread id comes from the browser, so keep it to a safe directory name.
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", thread)[:80] or "_unscoped"
-    return UPLOAD_ROOT / safe
+    return root / safe
 
 
 def _truncate(text: str) -> str:

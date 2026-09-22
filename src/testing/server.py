@@ -26,15 +26,13 @@ from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from pydantic import BaseModel
 
-from testing.agent import MAX_MODEL_CALLS, RECURSION_LIMIT, build_agent
-from testing.tools import (
-    OUTPUT_DIR,
-    image_attachments,
-    is_image,
-    set_upload_scope,
-    upload_dir,
-    upload_listing,
+from testing.agent import (
+    MAX_MODEL_CALLS,
+    RECURSION_LIMIT,
+    build_agent,
+    build_user_content,
 )
+from testing.tools import output_root, set_upload_scope, upload_dir
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_TOOL_RESULT_CHARS = 2000
@@ -313,38 +311,8 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 @app.post("/api/chat")
 async def chat(payload: ChatRequest) -> StreamingResponse:
-    message = payload.message
-    if payload.attachments:
-        # Number them from the same listing `read_document` resolves against,
-        # so "1" means the same file to the model as it does to the tool.
-        # These used to be numbered independently: the prompt numbered this
-        # message's attachments while the tool numbered every upload on disk,
-        # so a new chat asking about "1" was handed a document from an older
-        # conversation.
-        listed = upload_listing(payload.thread_id)
-        images = [n for n in payload.attachments if is_image(n)]
-        documents = [n for n in payload.attachments if not is_image(n)]
-        parts = [f"[The user just attached: {', '.join(payload.attachments)}."]
-        if images:
-            # The model is multimodal, so images travel in the message itself
-            # rather than through a tool.
-            parts.append(
-                f"The image(s) {', '.join(images)} are included below - "
-                f"look at them directly."
-            )
-        if documents:
-            parts.append(
-                f"Files in this conversation: {listed}. "
-                f"Read one with read_document and its NUMBER, e.g. read_document('1')."
-            )
-        message = " ".join(parts) + "]\n\n" + message
-
     await _touch_thread(payload.thread_id, payload.message)
-
-    blocks = image_attachments(payload.attachments, payload.thread_id)
-    content: Any = message
-    if blocks:
-        content = [{"type": "text", "text": message}, *blocks]
+    content = build_user_content(payload.message, payload.attachments, payload.thread_id)
 
     return StreamingResponse(
         _stream({"messages": [{"role": "user", "content": content}]}, payload.thread_id),
@@ -490,8 +458,9 @@ async def delete_thread(thread_id: str) -> dict[str, bool]:
 async def list_files(thread_id: str = Query(...)) -> dict[str, Any]:
     """List what the agent produced: real files on disk, plus its scratch workspace."""
     outputs = []
-    if OUTPUT_DIR.exists():
-        for path in sorted(OUTPUT_DIR.iterdir()):
+    directory = output_root()
+    if directory.exists():
+        for path in sorted(directory.iterdir()):
             if path.is_file():
                 stat = path.stat()
                 outputs.append({"name": path.name, "size": stat.st_size, "modified": stat.st_mtime})
@@ -508,8 +477,9 @@ async def list_files(thread_id: str = Query(...)) -> dict[str, Any]:
 @app.get("/api/files/output")
 async def download_output(name: str = Query(...)) -> FileResponse:
     """Download a real file from the outputs directory."""
-    path = (OUTPUT_DIR / Path(name).name).resolve()
-    if not path.is_file() or OUTPUT_DIR.resolve() not in path.parents:
+    directory = output_root()
+    path = (directory / Path(name).name).resolve()
+    if not path.is_file() or directory.resolve() not in path.parents:
         raise HTTPException(status_code=404, detail="file not found")
     return FileResponse(path, filename=path.name, media_type="application/octet-stream")
 

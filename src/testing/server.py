@@ -8,28 +8,103 @@ Then open http://127.0.0.1:8000
 import asyncio
 import json
 import os
+import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
+
 from deepagents.backends.utils import file_data_to_string
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from pydantic import BaseModel
 
 from testing.agent import MAX_MODEL_CALLS, RECURSION_LIMIT, build_agent
-from testing.tools import OUTPUT_DIR, UPLOAD_DIR
+from testing.tools import (
+    OUTPUT_DIR,
+    image_attachments,
+    is_image,
+    set_upload_scope,
+    upload_dir,
+    upload_listing,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_TOOL_RESULT_CHARS = 2000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
-app = FastAPI(title="Agent chat")
-agent = build_agent()
+DB_PATH = Path.cwd() / "conversations.sqlite"
+
+# Filled in by the lifespan below. The agent cannot be built at import time any
+# more: its checkpointer owns a database connection with a lifecycle.
+_runtime: dict[str, Any] = {"agent": None, "index": None}
+
+
+def get_agent():
+    agent = _runtime["agent"]
+    if agent is None:
+        raise HTTPException(status_code=503, detail="agent still starting")
+    return agent
+
+
+async def _open_index() -> aiosqlite.Connection:
+    """A small table listing conversations, for the history sidebar.
+
+    The checkpointer stores state per thread but has no notion of a title or an
+    ordering for humans, so keep our own index alongside it.
+    """
+    conn = await aiosqlite.connect(str(DB_PATH))
+    await conn.execute(
+        """CREATE TABLE IF NOT EXISTS threads (
+               thread_id  TEXT PRIMARY KEY,
+               title      TEXT NOT NULL,
+               created_at REAL NOT NULL,
+               updated_at REAL NOT NULL
+           )"""
+    )
+    await conn.commit()
+    return conn
+
+
+async def _touch_thread(thread_id: str, first_message: str) -> None:
+    """Record the conversation, keeping the title from its opening message."""
+    index: aiosqlite.Connection = _runtime["index"]
+    if index is None:
+        return
+    now = time.time()
+    title = " ".join(first_message.split())[:80] or "Untitled"
+    await index.execute(
+        """INSERT INTO threads (thread_id, title, created_at, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(thread_id) DO UPDATE SET updated_at = excluded.updated_at""",
+        (thread_id, title, now, now),
+    )
+    await index.commit()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    async with AsyncSqliteSaver.from_conn_string(str(DB_PATH)) as saver:
+        await saver.setup()
+        _runtime["index"] = await _open_index()
+        _runtime["agent"] = build_agent(checkpointer=saver)
+        try:
+            yield
+        finally:
+            _runtime["agent"] = None
+            index = _runtime.pop("index", None)
+            if index is not None:
+                await index.close()
+
+
+app = FastAPI(title="Agent chat", lifespan=lifespan)
 
 
 class ChatRequest(BaseModel):
@@ -144,6 +219,8 @@ async def _stream(agent_input: Any, thread_id: str) -> AsyncIterator[str]:
     which propagates `CancelledError` down into the HTTP request to the model.
     """
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
+    # Point the upload tools at this conversation's files for the whole run.
+    set_upload_scope(thread_id)
     cancelled = _cancel_event(thread_id)
     cancelled.clear()
 
@@ -154,7 +231,7 @@ async def _stream(agent_input: Any, thread_id: str) -> AsyncIterator[str]:
 
     async def pump() -> None:
         try:
-            async for item in agent.astream(
+            async for item in get_agent().astream(
                 agent_input,
                 config=config,
                 stream_mode=["messages", "updates"],
@@ -238,11 +315,39 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 async def chat(payload: ChatRequest) -> StreamingResponse:
     message = payload.message
     if payload.attachments:
-        attached = ", ".join(payload.attachments)
-        prefix = f"[The user attached: {attached}. Use read_document to read them.]"
-        message = f"{prefix}\n\n{message}"
+        # Number them from the same listing `read_document` resolves against,
+        # so "1" means the same file to the model as it does to the tool.
+        # These used to be numbered independently: the prompt numbered this
+        # message's attachments while the tool numbered every upload on disk,
+        # so a new chat asking about "1" was handed a document from an older
+        # conversation.
+        listed = upload_listing(payload.thread_id)
+        images = [n for n in payload.attachments if is_image(n)]
+        documents = [n for n in payload.attachments if not is_image(n)]
+        parts = [f"[The user just attached: {', '.join(payload.attachments)}."]
+        if images:
+            # The model is multimodal, so images travel in the message itself
+            # rather than through a tool.
+            parts.append(
+                f"The image(s) {', '.join(images)} are included below - "
+                f"look at them directly."
+            )
+        if documents:
+            parts.append(
+                f"Files in this conversation: {listed}. "
+                f"Read one with read_document and its NUMBER, e.g. read_document('1')."
+            )
+        message = " ".join(parts) + "]\n\n" + message
+
+    await _touch_thread(payload.thread_id, payload.message)
+
+    blocks = image_attachments(payload.attachments, payload.thread_id)
+    content: Any = message
+    if blocks:
+        content = [{"type": "text", "text": message}, *blocks]
+
     return StreamingResponse(
-        _stream({"messages": [{"role": "user", "content": message}]}, payload.thread_id),
+        _stream({"messages": [{"role": "user", "content": content}]}, payload.thread_id),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
@@ -259,14 +364,17 @@ async def resume(payload: ResumeRequest) -> StreamingResponse:
 
 
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Store an uploaded file where the `read_document` tool can find it."""
+async def upload(
+    file: UploadFile = File(...), thread_id: str = Form(...)
+) -> dict[str, Any]:
+    """Store an uploaded file where this conversation's `read_document` finds it."""
     content = await file.read()
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="file too large (max 20 MB)")
     name = Path(file.filename or "upload").name
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    (UPLOAD_DIR / name).write_bytes(content)
+    directory = upload_dir(thread_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_bytes(content)
     return {"name": name, "size": len(content)}
 
 
@@ -274,6 +382,107 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
 async def cancel(payload: CancelRequest) -> dict[str, bool]:
     """Ask an in-flight run on this thread to stop."""
     _cancel_event(payload.thread_id).set()
+    return {"ok": True}
+
+
+def _replay_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    """Rebuild the transcript for a conversation being reopened.
+
+    The live stream sends fine-grained events; reloading has only the stored
+    messages, so regroup them into the user / assistant turns the UI renders.
+    """
+    turns: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    for message in messages:
+        if isinstance(message, HumanMessage):
+            turns.append({"role": "user", "text": _text_of(message)})
+            current = None
+        elif isinstance(message, AIMessage):
+            if current is None:
+                current = {"role": "assistant", "text": "", "events": []}
+                turns.append(current)
+            current["text"] += _text_of(message)
+            for call in message.tool_calls or []:
+                current["events"].append(
+                    {
+                        "type": "tool_call",
+                        "name": call.get("name"),
+                        "args": call.get("args"),
+                        "id": call.get("id"),
+                    }
+                )
+        elif isinstance(message, ToolMessage):
+            if current is None:
+                current = {"role": "assistant", "text": "", "events": []}
+                turns.append(current)
+            result = str(message.content)
+            if len(result) > MAX_TOOL_RESULT_CHARS:
+                result = result[:MAX_TOOL_RESULT_CHARS] + "\n... (truncated)"
+            current["events"].append(
+                {
+                    "type": "tool_result",
+                    "name": message.name,
+                    "content": result,
+                    "id": message.tool_call_id,
+                }
+            )
+    return turns
+
+
+def _pending_approval(snapshot: Any) -> list[dict[str, Any]]:
+    """Any tool calls this conversation is paused waiting on."""
+    requests: list[dict[str, Any]] = []
+    for interrupt in getattr(snapshot, "interrupts", ()) or ():
+        value = getattr(interrupt, "value", {}) or {}
+        requests.extend(value.get("action_requests", []))
+    return requests
+
+
+@app.get("/api/threads")
+async def list_threads() -> dict[str, Any]:
+    """Conversations for the history sidebar, most recently used first."""
+    index: aiosqlite.Connection = _runtime.get("index")
+    if index is None:
+        return {"threads": []}
+    async with index.execute(
+        "SELECT thread_id, title, updated_at FROM threads ORDER BY updated_at DESC LIMIT 200"
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return {
+        "threads": [
+            {"thread_id": r[0], "title": r[1], "updated_at": r[2]} for r in rows
+        ]
+    }
+
+
+@app.get("/api/threads/{thread_id}")
+async def get_thread(thread_id: str) -> dict[str, Any]:
+    """Everything needed to reopen a conversation, including a pending approval."""
+    set_upload_scope(thread_id)
+    snapshot = await get_agent().aget_state({"configurable": {"thread_id": thread_id}})
+    messages = (snapshot.values or {}).get("messages") or []
+    return {
+        "thread_id": thread_id,
+        "turns": _replay_messages(messages),
+        "todos": (snapshot.values or {}).get("todos") or [],
+        "pending": _pending_approval(snapshot),
+    }
+
+
+@app.delete("/api/threads/{thread_id}")
+async def delete_thread(thread_id: str) -> dict[str, bool]:
+    """Forget a conversation: its checkpoints, its index row and its uploads."""
+    await get_agent().checkpointer.adelete_thread(thread_id)
+    index: aiosqlite.Connection = _runtime.get("index")
+    if index is not None:
+        await index.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
+        await index.commit()
+    directory = upload_dir(thread_id)
+    if directory.exists():
+        for path in directory.iterdir():
+            path.unlink(missing_ok=True)
+        directory.rmdir()
     return {"ok": True}
 
 
@@ -287,8 +496,9 @@ async def list_files(thread_id: str = Query(...)) -> dict[str, Any]:
                 stat = path.stat()
                 outputs.append({"name": path.name, "size": stat.st_size, "modified": stat.st_mtime})
 
+    set_upload_scope(thread_id)
     workspace = []
-    snapshot = await agent.aget_state({"configurable": {"thread_id": thread_id}})
+    snapshot = await get_agent().aget_state({"configurable": {"thread_id": thread_id}})
     for path_key, file_data in (snapshot.values.get("files") or {}).items():
         workspace.append({"path": path_key, "size": len(file_data_to_string(file_data))})
 
@@ -309,7 +519,7 @@ async def download_workspace_file(
     thread_id: str = Query(...), path: str = Query(...)
 ) -> PlainTextResponse:
     """Download a file from the agent's in-state scratch workspace."""
-    snapshot = await agent.aget_state({"configurable": {"thread_id": thread_id}})
+    snapshot = await get_agent().aget_state({"configurable": {"thread_id": thread_id}})
     file_data = (snapshot.values.get("files") or {}).get(path)
     if file_data is None:
         raise HTTPException(status_code=404, detail="file not found")

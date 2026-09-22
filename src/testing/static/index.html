@@ -21,8 +21,33 @@
   body {
     margin: 0; background: var(--bg); color: var(--text);
     font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    height: 100vh; display: flex; flex-direction: column;
+    height: 100vh; display: flex;
   }
+  #sidebar {
+    width: 260px; flex: none; border-right: 1px solid var(--border);
+    background: var(--panel); display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  #sidebar.collapsed { display: none; }
+  .sidebar-head { padding: 12px; border-bottom: 1px solid var(--border); }
+  .sidebar-head button { width: 100%; }
+  #thread-list { flex: 1; overflow-y: auto; padding: 8px; }
+  .thread {
+    display: flex; align-items: center; gap: 6px; padding: 8px 10px;
+    border-radius: 8px; cursor: pointer; font-size: 13px; color: var(--text);
+  }
+  .thread:hover { background: var(--tool-bg); }
+  .thread.active { background: var(--tool-bg); outline: 1px solid var(--accent); }
+  .thread .label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .thread .when { font-size: 11px; color: var(--muted); flex: none; }
+  .thread .kill {
+    border: none; background: none; color: var(--muted); cursor: pointer;
+    padding: 0 2px; font-size: 14px; line-height: 1; visibility: hidden;
+  }
+  .thread:hover .kill { visibility: visible; }
+  .thread .kill:hover { color: var(--danger); }
+  .sidebar-empty { color: var(--muted); font-size: 12px; padding: 12px 10px; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   header {
     display: flex; align-items: center; gap: 12px; padding: 12px 20px;
     border-bottom: 1px solid var(--border); background: var(--panel);
@@ -106,11 +131,31 @@
     background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
     padding: 8px; margin: 6px 0; font-size: 12px; overflow-x: auto;
   }
-  .approval .actions { display: flex; gap: 8px; margin-top: 10px; }
+  .approval .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
   .approval .approve { background: #16a34a; border-color: #16a34a; color: #fff; }
   .approval .reject { background: #dc2626; border-color: #dc2626; color: #fff; }
+  .approval .respond { background: var(--panel); color: var(--text); }
   .approval.decided .actions { display: none; }
   .approval .outcome { margin-top: 8px; color: var(--muted); font-style: italic; }
+  .approval .request + .request {
+    margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border);
+  }
+  .approval .req-head { margin-bottom: 6px; }
+  .approval .verdict { color: var(--muted); font-style: italic; }
+  .approval textarea.args {
+    width: 100%; font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; resize: vertical;
+  }
+  .approval textarea.args:disabled, .approval input.note:disabled {
+    opacity: .65; cursor: not-allowed;
+  }
+  .approval input.note {
+    width: 100%; margin-top: 6px; font: inherit; font-size: 12px;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px;
+  }
+  .approval .problem { color: var(--danger); font-size: 12px; margin-top: 6px; }
   .usage { font-size: 12px; color: var(--muted); }
   .attachments { max-width: 760px; margin: 0 auto 8px; display: flex; flex-wrap: wrap; gap: 6px; }
   .chip {
@@ -158,9 +203,15 @@
 </style>
 </head>
 <body>
+  <aside id="sidebar">
+    <div class="sidebar-head"><button id="new-chat">+ New chat</button></div>
+    <div id="thread-list"></div>
+  </aside>
+
+  <div id="main">
   <header>
+    <button id="toggle-sidebar" title="Show or hide history">&#9776;</button>
     <h1>Agent Playground</h1>
-    <button id="new-chat">New chat</button>
     <span class="status"><span class="dot" id="dot"></span><span id="status-text">checking...</span></span>
   </header>
 
@@ -177,6 +228,7 @@
     </form>
     <div class="hint" id="thread-hint"></div>
   </footer>
+  </div>
 
 <script>
 const messagesEl = document.getElementById("messages");
@@ -431,6 +483,100 @@ function addError(turn, message) {
   scrollDown();
 }
 
+// ---------- conversation history ----------
+function when(ts) {
+  const diff = Date.now() / 1000 - ts;
+  if (diff < 60) return "now";
+  if (diff < 3600) return Math.floor(diff / 60) + "m";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h";
+  return Math.floor(diff / 86400) + "d";
+}
+
+async function refreshThreads() {
+  const list = document.getElementById("thread-list");
+  try {
+    const data = await (await fetch("/api/threads")).json();
+    list.replaceChildren();
+    if (!data.threads.length) {
+      const empty = document.createElement("div");
+      empty.className = "sidebar-empty";
+      empty.textContent = "No conversations yet.";
+      list.appendChild(empty);
+      return;
+    }
+    for (const t of data.threads) {
+      const row = document.createElement("div");
+      row.className = "thread" + (t.thread_id === threadId ? " active" : "");
+      const label = document.createElement("span");
+      label.className = "label";
+      label.textContent = t.title;
+      label.title = t.title;
+      const age = document.createElement("span");
+      age.className = "when";
+      age.textContent = when(t.updated_at);
+      const kill = document.createElement("button");
+      kill.className = "kill";
+      kill.textContent = "×";
+      kill.title = "Delete this conversation";
+      kill.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm("Delete this conversation and its uploads?")) return;
+        await fetch("/api/threads/" + encodeURIComponent(t.thread_id), { method: "DELETE" });
+        if (t.thread_id === threadId) startNewChat();
+        else refreshThreads();
+      });
+      row.addEventListener("click", () => openThread(t.thread_id));
+      row.append(label, age, kill);
+      list.appendChild(row);
+    }
+  } catch {
+    /* sidebar is a convenience; never block the chat on it */
+  }
+}
+
+// Rebuild a stored conversation, including an approval it is still waiting on.
+async function openThread(id) {
+  if (busy) return;
+  const data = await (await fetch("/api/threads/" + encodeURIComponent(id))).json();
+  threadId = id;
+  hintEl.textContent = "thread: " + threadId;
+  messagesEl.replaceChildren();
+  clearAttachments();
+
+  let turn = null;
+  for (const entry of data.turns) {
+    if (entry.role === "user") {
+      addUser(entry.text);
+      turn = null;
+    } else {
+      turn = addAssistant();
+      turn.body.classList.remove("cursor");
+      for (const event of entry.events || []) addTool(turn, event);
+      turn.raw = entry.text || "";
+      paint(turn);
+    }
+  }
+  if (data.todos && data.todos.length && turn) paintPlan(turn, data.todos);
+  if (data.pending && data.pending.length) {
+    if (!turn) turn = addAssistant();
+    turn.body.classList.remove("cursor");
+    addApproval(turn, data.pending);
+  }
+  refreshThreads();
+  refreshFiles();
+  scrollDown();
+}
+
+function startNewChat() {
+  threadId = crypto.randomUUID();
+  messagesEl.replaceChildren();
+  hintEl.textContent = "thread: " + threadId;
+  clearAttachments();
+  inputEl.focus();
+  refreshFiles();
+  refreshThreads();
+}
+
 // ---------- attachments ----------
 const attachments = [];
 
@@ -464,6 +610,8 @@ async function uploadFiles(fileList) {
   for (const file of fileList) {
     const form = new FormData();
     form.append("file", file);
+    // Uploads belong to one conversation, so a new chat cannot read them.
+    form.append("thread_id", threadId);
     try {
       const res = await fetch("/api/upload", { method: "POST", body: form });
       if (!res.ok) throw new Error("HTTP " + res.status + ": " + (await res.text()));
@@ -529,6 +677,10 @@ async function refreshFiles() {
 }
 
 // ---------- approvals ----------
+// One card per pending tool call. Each call gets its own decision, because the
+// agent can ask for several at once and you may want to allow one and refuse
+// another. langchain requires exactly one decision per request, in order, so
+// nothing is sent until every call has been decided.
 function addApproval(turn, requests) {
   const card = document.createElement("div");
   card.className = "approval";
@@ -536,45 +688,123 @@ function addApproval(turn, requests) {
   const title = document.createElement("h4");
   title.textContent =
     requests.length > 1
-      ? "The agent wants to run " + requests.length + " tools. Approve?"
+      ? "The agent wants to run " + requests.length + " tools. Decide on each:"
       : "The agent wants to run a tool. Approve?";
   card.appendChild(title);
 
-  for (const req of requests) {
-    const name = document.createElement("div");
-    const bold = document.createElement("b");
-    bold.textContent = req.name || "tool";
-    name.appendChild(bold);
-    const args = document.createElement("pre");
-    args.textContent = JSON.stringify(req.args || {}, null, 2);
-    card.append(name, args);
-  }
+  const decisions = new Array(requests.length).fill(null);
 
-  const actions = document.createElement("div");
-  actions.className = "actions";
-  const approve = document.createElement("button");
-  approve.className = "approve";
-  approve.textContent = requests.length > 1 ? "Approve all" : "Approve";
-  const reject = document.createElement("button");
-  reject.className = "reject";
-  reject.textContent = requests.length > 1 ? "Reject all" : "Reject";
-  actions.append(approve, reject);
-  card.appendChild(actions);
-
-  const decide = (type) => {
+  const submitIfComplete = () => {
+    if (decisions.some((d) => d === null)) return;
     card.classList.add("decided");
-    const outcome = document.createElement("div");
-    outcome.className = "outcome";
-    outcome.textContent = type === "approve" ? "Approved." : "Rejected.";
-    card.appendChild(outcome);
-    // One decision per pending request, in order. The server rejects a
-    // mismatched count.
-    const decisions = requests.map(() => ({ type: type }));
+    const summary = document.createElement("div");
+    summary.className = "outcome";
+    summary.textContent = decisions
+      .map((d, i) => (requests[i].name || "tool") + ": " + d.type)
+      .join(" · ");
+    card.appendChild(summary);
     resumeRun(turn, decisions);
   };
 
-  approve.addEventListener("click", () => decide("approve"));
-  reject.addEventListener("click", () => decide("reject"));
+  requests.forEach((req, index) => {
+    const row = document.createElement("div");
+    row.className = "request";
+
+    const head = document.createElement("div");
+    head.className = "req-head";
+    const name = document.createElement("b");
+    name.textContent = req.name || "tool";
+    const verdict = document.createElement("span");
+    verdict.className = "verdict";
+    head.append(name, verdict);
+
+    const original = JSON.stringify(req.args || {}, null, 2);
+    const args = document.createElement("textarea");
+    args.className = "args";
+    args.value = original;
+    args.spellcheck = false;
+    args.rows = Math.min(original.split("\n").length + 1, 14);
+
+    const note = document.createElement("input");
+    note.className = "note";
+    note.type = "text";
+    note.placeholder = "Reason for rejecting, or the answer to give instead";
+
+    const problem = document.createElement("div");
+    problem.className = "problem";
+    problem.hidden = true;
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const approve = document.createElement("button");
+    approve.className = "approve";
+    approve.textContent = "Approve";
+    const reject = document.createElement("button");
+    reject.className = "reject";
+    reject.textContent = "Reject";
+    const respond = document.createElement("button");
+    respond.className = "respond";
+    respond.textContent = "Answer instead";
+    respond.title = "Skip the tool and give the agent this answer as its result";
+    actions.append(approve, reject, respond);
+
+    // Editing the arguments turns Approve into an edit decision — same tool,
+    // your arguments.
+    const edited = () => args.value.trim() !== original.trim();
+    args.addEventListener("input", () => {
+      approve.textContent = edited() ? "Run with edits" : "Approve";
+    });
+
+    const settle = (decision, label) => {
+      decisions[index] = decision;
+      verdict.textContent = " — " + label;
+      args.disabled = true;
+      note.disabled = true;
+      actions.remove();
+      problem.hidden = true;
+      submitIfComplete();
+    };
+
+    const fail = (message) => {
+      problem.textContent = message;
+      problem.hidden = false;
+    };
+
+    approve.addEventListener("click", () => {
+      if (!edited()) return settle({ type: "approve" }, "approved");
+      let parsed;
+      try {
+        parsed = JSON.parse(args.value);
+      } catch (err) {
+        return fail("Arguments are not valid JSON: " + err.message);
+      }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return fail("Arguments must be a JSON object.");
+      }
+      settle(
+        { type: "edit", edited_action: { name: req.name, args: parsed } },
+        "edited and approved"
+      );
+    });
+
+    reject.addEventListener("click", () => {
+      const reason = note.value.trim();
+      const decision = { type: "reject" };
+      if (reason) decision.message = reason;
+      settle(decision, reason ? "rejected: " + reason : "rejected");
+    });
+
+    respond.addEventListener("click", () => {
+      const reply = note.value.trim();
+      if (!reply) {
+        return fail("Type the answer to give the agent, then press Answer instead.");
+      }
+      settle({ type: "respond", message: reply }, "answered instead");
+    });
+
+    row.append(head, args, note, problem, actions);
+    card.appendChild(row);
+  });
 
   turn.root.appendChild(card);
   scrollDown();
@@ -669,6 +899,7 @@ async function runTurn(url, body, turn) {
     setSendButton(false);
     inputEl.focus();
     refreshFiles();
+    refreshThreads();
   }
 }
 
@@ -726,16 +957,14 @@ fileInput.addEventListener("change", async () => {
   fileInput.value = "";
 });
 
-document.getElementById("new-chat").addEventListener("click", () => {
-  threadId = crypto.randomUUID();
-  messagesEl.innerHTML = "";
-  hintEl.textContent = "thread: " + threadId;
-  clearAttachments();
-  inputEl.focus();
-  refreshFiles();
+document.getElementById("new-chat").addEventListener("click", startNewChat);
+
+document.getElementById("toggle-sidebar").addEventListener("click", () => {
+  document.getElementById("sidebar").classList.toggle("collapsed");
 });
 
 refreshFiles();
+refreshThreads();
 
 fetch("/api/health")
   .then((r) => r.json())
